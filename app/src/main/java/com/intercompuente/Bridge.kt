@@ -23,6 +23,8 @@ import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.tanh
 
 /**
  * Puente de voz entre dos teléfonos por red local (hotspot / WiFi).
@@ -58,6 +60,8 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
     private val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private var prevVoiceVolume = -1
 
     // ---------------------------------------------------------------- ciclo de vida
 
@@ -189,6 +193,7 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
     private fun routeAudio() {
         val am = audioManager
         am.mode = AudioManager.MODE_IN_COMMUNICATION
+        boostVolumeAndFocus()
         var name = "altavoz del teléfono"
         useBt = false
 
@@ -218,8 +223,62 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         BridgeState.route = name
     }
 
+    /** Volumen de llamada al máximo y foco de audio exclusivo (los demás audios se pausan). */
+    private fun boostVolumeAndFocus() {
+        try {
+            prevVoiceVolume = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            audioManager.setStreamVolume(
+                AudioManager.STREAM_VOICE_CALL,
+                audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL),
+                0
+            )
+        } catch (e: Exception) { }
+        try {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { }
+                .build()
+            audioManager.requestAudioFocus(req)
+            focusRequest = req
+        } catch (e: Exception) { }
+    }
+
+    /** Sube el volumen de las muestras PCM 16-bit little-endian; limitador suave contra distorsión. */
+    private fun applyGain(f: ByteArray, gain: Float) {
+        if (gain <= 1.01f) return
+        var i = 0
+        while (i + 1 < f.size) {
+            val s = (f[i + 1].toInt() shl 8) or (f[i].toInt() and 0xff)
+            val x = (s / 32768f) * gain
+            val ax = abs(x)
+            val y = if (ax < 0.5f) {
+                x
+            } else {
+                val limited = 0.5f + 0.5f * tanh((ax - 0.5f) / 0.5f)
+                if (x < 0f) -limited else limited
+            }
+            val o = (y * 32767f).toInt()
+            f[i] = (o and 0xff).toByte()
+            f[i + 1] = ((o shr 8) and 0xff).toByte()
+            i += 2
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun resetAudio() {
+        try {
+            val req = focusRequest
+            if (req != null) audioManager.abandonAudioFocusRequest(req)
+            focusRequest = null
+            if (prevVoiceVolume >= 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, prevVoiceVolume, 0)
+            }
+        } catch (e: Exception) { }
         try {
             if (Build.VERSION.SDK_INT >= 31) {
                 audioManager.clearCommunicationDevice()
@@ -364,6 +423,7 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
             val f = queue.poll(40, TimeUnit.MILLISECONDS)
             BridgeState.queued = queue.size
             if (f != null) {
+                applyGain(f, BridgeState.gain)
                 t.write(f, 0, f.size)
             } else {
                 t.write(silence, 0, silence.size)

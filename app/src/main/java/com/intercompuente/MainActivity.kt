@@ -15,6 +15,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 
@@ -59,6 +60,26 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT
             setSingleLine(true)
         }
+        val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+        val gainLabel = TextView(this).apply { textSize = 14f; setPadding(0, pad / 2, 0, 0) }
+        val gainBar = SeekBar(this).apply {
+            max = 14   // 1.0x a 8.0x en pasos de 0.5x
+            progress = prefs.getInt("gain", 4)
+        }
+        fun applyGainUi() {
+            val g = 1f + gainBar.progress * 0.5f
+            BridgeState.gain = g
+            gainLabel.text = "Volumen de la voz recibida: " + g + "x"
+            prefs.edit().putInt("gain", gainBar.progress).apply()
+        }
+        gainBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                applyGainUi()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        applyGainUi()
         muteBox = CheckBox(this).apply { text = "Silenciar mi micrófono" }
         startBtn = Button(this).apply { text = "Iniciar puente" }
         statusView = TextView(this).apply {
@@ -70,6 +91,8 @@ class MainActivity : Activity() {
         root.addView(title)
         root.addView(help)
         root.addView(peerInput)
+        root.addView(gainLabel)
+        root.addView(gainBar)
         root.addView(muteBox)
         root.addView(startBtn)
         root.addView(statusView)
