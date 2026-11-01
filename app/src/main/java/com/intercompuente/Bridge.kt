@@ -257,10 +257,13 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
             val s = (f[i + 1].toInt() shl 8) or (f[i].toInt() and 0xff)
             val x = (s / 32768f) * gain
             val ax = abs(x)
-            val y = if (ax < 0.5f) {
+            // rodilla baja: todo lo que pasa de 0.25 se comprime suavemente hacia 1.0,
+            // así con ganancias altas el nivel promedio sube sin recortar de golpe
+            val knee = 0.25f
+            val y = if (ax < knee) {
                 x
             } else {
-                val limited = 0.5f + 0.5f * tanh((ax - 0.5f) / 0.5f)
+                val limited = knee + (1f - knee) * tanh((ax - knee) / (1f - knee))
                 if (x < 0f) -limited else limited
             }
             val o = (y * 32767f).toInt()

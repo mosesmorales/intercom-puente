@@ -63,14 +63,14 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
         val gainLabel = TextView(this).apply { textSize = 14f; setPadding(0, pad / 2, 0, 0) }
         val gainBar = SeekBar(this).apply {
-            max = 14   // 1.0x a 8.0x en pasos de 0.5x
-            progress = prefs.getInt("gain", 4)
+            max = 19   // 1x a 20x en pasos de 1x
+            progress = prefs.getInt("gain2", 5)
         }
         fun applyGainUi() {
-            val g = 1f + gainBar.progress * 0.5f
-            BridgeState.gain = g
+            val g = 1 + gainBar.progress
+            BridgeState.gain = g.toFloat()
             gainLabel.text = "Volumen de la voz recibida: " + g + "x"
-            prefs.edit().putInt("gain", gainBar.progress).apply()
+            prefs.edit().putInt("gain2", gainBar.progress).apply()
         }
         gainBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
