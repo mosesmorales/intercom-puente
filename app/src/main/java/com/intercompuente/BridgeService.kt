@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.media.audiofx.AudioEffect
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -45,6 +46,14 @@ class BridgeService : Service() {
                 BridgeState.error = "Bluetooth apagado: puente detenido"
                 stopSelf()
             }
+        }
+    }
+
+    /** Avisos de sesión de audio de Spotify y similares (por si llegan como difusión implícita). */
+    private val effectReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val i = intent ?: return
+            EffectBooster.handle(i)
         }
     }
 
@@ -101,8 +110,10 @@ class BridgeService : Service() {
     override fun onDestroy() {
         if (btRegistered) {
             try { unregisterReceiver(btReceiver) } catch (e: Exception) { }
+            try { unregisterReceiver(effectReceiver) } catch (e: Exception) { }
             btRegistered = false
         }
+        EffectBooster.enable(false)
         try { projection?.stop() } catch (e: Exception) { }
         projection = null
         val b = bridge
@@ -114,10 +125,16 @@ class BridgeService : Service() {
     private fun registerBtReceiver() {
         if (btRegistered) return
         val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        val effectFilter = IntentFilter().apply {
+            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+        }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(btReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(effectReceiver, effectFilter, Context.RECEIVER_EXPORTED)
         } else {
             registerReceiver(btReceiver, filter)
+            registerReceiver(effectReceiver, effectFilter)
         }
         btRegistered = true
     }

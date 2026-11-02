@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private lateinit var peerInput: EditText
     private lateinit var muteBox: CheckBox
     private lateinit var musicBox: CheckBox
+    private lateinit var effectBox: CheckBox
     private val handler = Handler(Looper.getMainLooper())
     private var pendingStart = false
 
@@ -81,9 +82,14 @@ class MainActivity : Activity() {
 
         addGainRow(root, pad, "Volumen de la voz recibida", "gain2", 5, 19) { BridgeState.gain = it }
 
-        musicBox = CheckBox(this).apply { text = "Mezclar mi música (captura el audio de otras apps)" }
+        musicBox = CheckBox(this).apply { text = "Música por captura (reproductores que lo permiten)" }
         root.addView(musicBox)
-        addGainRow(root, pad, "Volumen de mi música", "mgain", 2, 9) { BridgeState.musicGain = it }
+        effectBox = CheckBox(this).apply { text = "Potenciar Spotify y apps con ecualizador (sin captura)" }
+        root.addView(effectBox)
+        addGainRow(root, pad, "Volumen de mi música", "mgain", 2, 9) {
+            BridgeState.musicGain = it
+            EffectBooster.setGain(it)
+        }
 
         muteBox = CheckBox(this).apply { text = "Silenciar mi micrófono" }
         startBtn = Button(this).apply { text = "Iniciar puente" }
@@ -295,6 +301,8 @@ class MainActivity : Activity() {
     private fun refresh() {
         val s = BridgeState
         s.muted = muteBox.isChecked
+        // el potenciador por sesión de audio solo trabaja mientras el puente está activo
+        EffectBooster.enable(effectBox.isChecked && s.running)
         startBtn.text = if (s.running) "Detener puente" else "Iniciar puente"
         statusView.text = buildString {
             append("Estado: ").append(if (s.running) "activo" else "detenido").append('\n')
@@ -309,6 +317,7 @@ class MainActivity : Activity() {
             } else {
                 append("Música: apagada\n")
             }
+            append("Potenciador: ").append(EffectBooster.status()).append('\n')
             append("Otro teléfono: ").append(s.peer).append('\n')
             append("Enviados: ").append(s.tx).append("   Recibidos: ").append(s.rx).append('\n')
             append("Cola: ").append(s.queued).append('\n')
