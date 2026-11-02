@@ -383,6 +383,19 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         }
     }
 
+    /** Pico de una trama PCM 16-bit little-endian, de 0 a 100. */
+    private fun peakPercent(b: ByteArray): Int {
+        var peak = 0
+        var i = 0
+        while (i + 1 < b.size) {
+            val s = (b[i + 1].toInt() shl 8) or (b[i].toInt() and 0xff)
+            val a = if (s < 0) -s else s
+            if (a > peak) peak = a
+            i += 2
+        }
+        return peak * 100 / 32768
+    }
+
     @Suppress("DEPRECATION")
     private fun resetAudio() {
         abandonVoiceFocus()
@@ -660,6 +673,7 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
             rec.startRecording()
             mt.play()
             val buf = ByteArray(frameBytes)
+            var silentFrames = 0
             while (running && musicRunning) {
                 var got = 0
                 while (got < frameBytes && running && musicRunning) {
@@ -672,7 +686,12 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
                     }
                 }
                 if (!(running && musicRunning)) break
+                val inPeak = peakPercent(buf)
+                BridgeState.musicIn = inPeak
+                if (inPeak == 0) silentFrames++ else silentFrames = 0
+                BridgeState.musicSilentSec = silentFrames / 50
                 applyGain(buf, BridgeState.musicGain)
+                BridgeState.musicOut = peakPercent(buf)
                 mt.write(buf, 0, frameBytes)
             }
         } finally {

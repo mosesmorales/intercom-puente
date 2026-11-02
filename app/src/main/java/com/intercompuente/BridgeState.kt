@@ -7,6 +7,9 @@ object BridgeState {
     @Volatile var gain: Float = 6f
     @Volatile var musicGain: Float = 3f
     @Volatile var musicOn: Boolean = false
+    @Volatile var musicIn: Int = 0
+    @Volatile var musicOut: Int = 0
+    @Volatile var musicSilentSec: Int = 0
     @Volatile var route: String = "-"
     @Volatile var peer: String = "-"
     @Volatile var wifi: String = "-"

@@ -301,7 +301,14 @@ class MainActivity : Activity() {
             append("Bluetooth: ").append(btSummary()).append('\n')
             append("Audio: ").append(s.route).append('\n')
             append("Wi-Fi: ").append(s.wifi).append('\n')
-            append("Música: ").append(if (s.musicOn) "activa" else "apagada").append('\n')
+            if (s.musicOn) {
+                append("Música: activa  entra ").append(s.musicIn).append("%  sale ").append(s.musicOut).append("%\n")
+                if (s.musicSilentSec >= 3) {
+                    append("  SIN AUDIO captado: esa app bloquea la captura o está en pausa\n")
+                }
+            } else {
+                append("Música: apagada\n")
+            }
             append("Otro teléfono: ").append(s.peer).append('\n')
             append("Enviados: ").append(s.tx).append("   Recibidos: ").append(s.rx).append('\n')
             append("Cola: ").append(s.queued).append('\n')
