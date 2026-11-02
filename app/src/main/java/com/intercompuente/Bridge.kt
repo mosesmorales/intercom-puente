@@ -2,13 +2,20 @@ package com.intercompuente
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
@@ -33,6 +40,9 @@ import kotlin.math.tanh
  * Cada teléfono toma el audio del micrófono (que Android enruta al intercomunicador
  * Bluetooth) y lo manda por UDP al otro; lo que recibe lo reproduce por la salida
  * de voz (que Android enruta al mismo intercomunicador).
+ *
+ * Opcionalmente captura la música de otras apps y la reproduce con ganancia por la
+ * misma ruta (AudioPlaybackCapture + MediaProjection).
  */
 class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
 
@@ -55,14 +65,29 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
     @Volatile private var track: AudioTrack? = null
     @Volatile private var audioSocket: DatagramSocket? = null
     @Volatile private var helloSocket: DatagramSocket? = null
+    @Volatile private var musicRunning = false
 
     private val threads = ArrayList<Thread>()
+    private var musicThread: Thread? = null
     private val queue = ArrayBlockingQueue<ByteArray>(32)
     private val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var wifiLockLowLatency: WifiManager.WifiLock? = null
+    private var wifiLockPerf: WifiManager.WifiLock? = null
     private var focusRequest: AudioFocusRequest? = null
     private var prevVoiceVolume = -1
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Avisa cuando se conecta o desconecta un dispositivo de audio (p. ej. el intercom). */
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            if (running) chooseRoute()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            if (running) chooseRoute()
+        }
+    }
 
     // ---------------------------------------------------------------- ciclo de vida
 
@@ -79,6 +104,10 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         try {
             acquireLocks()
             routeAudio()
+            try {
+                audioManager.registerAudioDeviceCallback(deviceCallback, null)
+            } catch (e: Exception) { }
+            holdWifiNetwork()
             refreshLocal()
 
             if (!manualIp.isNullOrBlank()) {
@@ -123,6 +152,8 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         running = false
         BridgeState.running = false
 
+        stopMusicInternal()
+
         try { audioSocket?.close() } catch (e: Exception) { }
         try { helloSocket?.close() } catch (e: Exception) { }
         for (t in threads) t.interrupt()
@@ -140,14 +171,19 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         track = null
         queue.clear()
 
+        try { audioManager.unregisterAudioDeviceCallback(deviceCallback) } catch (e: Exception) { }
+        releaseWifiNetwork()
         resetAudio()
         try { wakeLock?.release() } catch (e: Exception) { }
-        try { wifiLock?.release() } catch (e: Exception) { }
+        try { wifiLockLowLatency?.release() } catch (e: Exception) { }
+        try { wifiLockPerf?.release() } catch (e: Exception) { }
         wakeLock = null
-        wifiLock = null
+        wifiLockLowLatency = null
+        wifiLockPerf = null
         peer = null
         BridgeState.peer = "-"
         BridgeState.route = "-"
+        BridgeState.wifi = "-"
     }
 
     private fun launch(name: String, block: () -> Unit) {
@@ -163,8 +199,9 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         t.start()
     }
 
-    // ---------------------------------------------------------------- bloqueos
+    // ---------------------------------------------------------------- bloqueos y red
 
+    @Suppress("DEPRECATION")
     private fun acquireLocks() {
         try {
             val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -175,57 +212,117 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         } catch (e: Exception) { }
         try {
             val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val mode = if (Build.VERSION.SDK_INT >= 29) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            if (Build.VERSION.SDK_INT >= 29) {
+                val ll = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "intercompuente:wifi-ll")
+                ll.setReferenceCounted(false)
+                ll.acquire()
+                wifiLockLowLatency = ll
             }
-            val wl = wm.createWifiLock(mode, "intercompuente:wifi")
-            wl.setReferenceCounted(false)
-            wl.acquire()
-            wifiLock = wl
+            val hp = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "intercompuente:wifi-hp")
+            hp.setReferenceCounted(false)
+            hp.acquire()
+            wifiLockPerf = hp
+        } catch (e: Exception) { }
+    }
+
+    /**
+     * Pide a Android una red Wi-Fi y la mantiene "en uso". Así el sistema no la da de baja
+     * por considerarla innecesaria (típico de un hotspot sin internet) mientras el puente corre.
+     */
+    private fun holdWifiNetwork() {
+        BridgeState.wifi = "sin red Wi-Fi cliente (normal si este teléfono es el hotspot)"
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    BridgeState.wifi = "conectado"
+                }
+
+                override fun onLost(network: Network) {
+                    BridgeState.wifi = "se perdió, esperando reconexión..."
+                }
+            }
+            cm.requestNetwork(req, cb)
+            netCallback = cb
+        } catch (e: Exception) {
+            BridgeState.wifi = "no disponible: ${e.message}"
+        }
+    }
+
+    private fun releaseWifiNetwork() {
+        val cb = netCallback ?: return
+        netCallback = null
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
         } catch (e: Exception) { }
     }
 
     // ---------------------------------------------------------------- ruta de audio
 
-    @Suppress("DEPRECATION")
     private fun routeAudio() {
-        val am = audioManager
-        am.mode = AudioManager.MODE_IN_COMMUNICATION
-        boostVolumeAndFocus()
-        var name = "altavoz del teléfono"
-        useBt = false
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        boostVolume()
+        requestVoiceFocus()
+        chooseRoute()
+    }
 
-        if (Build.VERSION.SDK_INT >= 31) {
-            val devs = am.availableCommunicationDevices
-            val bt = devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-                ?: devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
-            if (bt != null && am.setCommunicationDevice(bt)) {
-                useBt = true
-                name = "Bluetooth: ${bt.productName}"
+    /** Elige Bluetooth si hay un intercom conectado; si no, el altavoz del teléfono. */
+    @Suppress("DEPRECATION")
+    private fun chooseRoute() {
+        val am = audioManager
+        var name = "altavoz del teléfono"
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val devs = am.availableCommunicationDevices
+                val bt = devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                    ?: devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+                val current = am.communicationDevice
+                if (bt != null) {
+                    val ok = if (!useBt || current == null || current.id != bt.id) {
+                        am.setCommunicationDevice(bt)
+                    } else {
+                        true
+                    }
+                    useBt = ok
+                    name = if (ok) "Bluetooth: ${bt.productName}" else "altavoz del teléfono (falló Bluetooth)"
+                } else {
+                    if (useBt || current == null) {
+                        val spk = devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                        if (spk != null) am.setCommunicationDevice(spk)
+                    }
+                    useBt = false
+                }
             } else {
-                val spk = devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                if (spk != null) am.setCommunicationDevice(spk)
+                val hasBt = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    .any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                if (hasBt) {
+                    if (!useBt) {
+                        am.startBluetoothSco()
+                        am.isBluetoothScoOn = true
+                    }
+                    useBt = true
+                    name = "Bluetooth (SCO)"
+                } else {
+                    if (useBt) {
+                        am.stopBluetoothSco()
+                        am.isBluetoothScoOn = false
+                    }
+                    am.isSpeakerphoneOn = true
+                    useBt = false
+                }
             }
-        } else {
-            val hasBt = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                .any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            if (hasBt) {
-                am.startBluetoothSco()
-                am.isBluetoothScoOn = true
-                useBt = true
-                name = "Bluetooth (SCO)"
-            } else {
-                am.isSpeakerphoneOn = true
-            }
+        } catch (e: Exception) {
+            BridgeState.error = "Ruta de audio: ${e.message}"
         }
         BridgeState.route = name
     }
 
-    /** Volumen de llamada al máximo y foco de audio exclusivo (los demás audios se pausan). */
-    private fun boostVolumeAndFocus() {
+    /** Volumen de llamada al máximo (se restaura al detener). */
+    private fun boostVolume() {
         try {
             prevVoiceVolume = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
             audioManager.setStreamVolume(
@@ -234,6 +331,11 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
                 0
             )
         } catch (e: Exception) { }
+    }
+
+    /** Foco de audio exclusivo: las apps de música se pausan mientras la voz está activa. */
+    private fun requestVoiceFocus() {
+        if (focusRequest != null) return
         try {
             val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                 .setAudioAttributes(
@@ -249,7 +351,15 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
         } catch (e: Exception) { }
     }
 
-    /** Sube el volumen de las muestras PCM 16-bit little-endian; limitador suave contra distorsión. */
+    private fun abandonVoiceFocus() {
+        val req = focusRequest ?: return
+        focusRequest = null
+        try {
+            audioManager.abandonAudioFocusRequest(req)
+        } catch (e: Exception) { }
+    }
+
+    /** Sube el volumen de muestras PCM 16-bit little-endian; limitador suave contra distorsión. */
     private fun applyGain(f: ByteArray, gain: Float) {
         if (gain <= 1.01f) return
         var i = 0
@@ -275,10 +385,8 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
 
     @Suppress("DEPRECATION")
     private fun resetAudio() {
+        abandonVoiceFocus()
         try {
-            val req = focusRequest
-            if (req != null) audioManager.abandonAudioFocusRequest(req)
-            focusRequest = null
             if (prevVoiceVolume >= 0) {
                 audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, prevVoiceVolume, 0)
             }
@@ -293,6 +401,7 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
             }
             audioManager.mode = AudioManager.MODE_NORMAL
         } catch (e: Exception) { }
+        useBt = false
     }
 
     private fun btInput(): AudioDeviceInfo? =
@@ -433,6 +542,145 @@ class Bridge(private val ctx: Context, private val onFatal: () -> Unit) {
                 t.write(silence, 0, silence.size)
                 primed = false
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- música propia
+
+    /** Captura el audio de otras apps (música) y lo reproduce con ganancia por la ruta del intercom. */
+    @Synchronized
+    fun startMusic(p: MediaProjection) {
+        if (!running || musicRunning) return
+        if (Build.VERSION.SDK_INT < 29) {
+            BridgeState.error = "La música necesita Android 10 o superior"
+            return
+        }
+        // sin soltar el foco exclusivo, las apps de música se pausan solas y no hay nada que capturar
+        abandonVoiceFocus()
+        musicRunning = true
+        BridgeState.musicOn = true
+        val t = Thread({
+            try {
+                musicLoop(p)
+            } catch (e: Exception) {
+                if (running) BridgeState.error = "Música: ${e.message}"
+            } finally {
+                musicRunning = false
+                BridgeState.musicOn = false
+            }
+        }, "bridge-music")
+        t.isDaemon = true
+        musicThread = t
+        t.start()
+    }
+
+    @Synchronized
+    fun stopMusic() {
+        stopMusicInternal()
+        if (running) requestVoiceFocus()
+    }
+
+    private fun stopMusicInternal() {
+        if (!musicRunning && musicThread == null) return
+        musicRunning = false
+        val t = musicThread
+        try { t?.interrupt() } catch (e: Exception) { }
+        try { t?.join(1500) } catch (e: Exception) { }
+        musicThread = null
+        BridgeState.musicOn = false
+    }
+
+    private fun buildCapture(cfg: AudioPlaybackCaptureConfiguration, rate: Int): AudioRecord? {
+        return try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(cfg)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuf, rate / 50 * 2 * 4))
+                .build()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun musicLoop(p: MediaProjection) {
+        val cfg = AudioPlaybackCaptureConfiguration.Builder(p)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .build()
+
+        var rate = 16000
+        var rec = buildCapture(cfg, rate)
+        if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
+            try { rec?.release() } catch (e: Exception) { }
+            rate = 48000
+            rec = buildCapture(cfg, rate)
+        }
+        if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
+            BridgeState.error = "No se pudo capturar el audio de la música"
+            return
+        }
+
+        val frameBytes = rate / 50 * 2
+        val trackMin = AudioTrack.getMinBufferSize(
+            rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val mt = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(trackMin, frameBytes * 6))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        if (useBt) {
+            val d = btOutput()
+            if (d != null) mt.setPreferredDevice(d)
+        }
+
+        try {
+            rec.startRecording()
+            mt.play()
+            val buf = ByteArray(frameBytes)
+            while (running && musicRunning) {
+                var got = 0
+                while (got < frameBytes && running && musicRunning) {
+                    val n = rec.read(buf, got, frameBytes - got)
+                    if (n > 0) {
+                        got += n
+                    } else {
+                        if (n < 0) BridgeState.error = "Error al capturar la música ($n)"
+                        Thread.sleep(10)
+                    }
+                }
+                if (!(running && musicRunning)) break
+                applyGain(buf, BridgeState.musicGain)
+                mt.write(buf, 0, frameBytes)
+            }
+        } finally {
+            try { rec.stop() } catch (e: Exception) { }
+            try { rec.release() } catch (e: Exception) { }
+            try { mt.pause() } catch (e: Exception) { }
+            try { mt.flush() } catch (e: Exception) { }
+            try { mt.release() } catch (e: Exception) { }
         }
     }
 

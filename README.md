@@ -38,7 +38,20 @@ para que no haya acople.
 - La ruta Bluetooth usa el perfil de manos libres (llamada), no el de música.
 - Compila solo con GitHub Actions: cada push a `main` genera un APK nuevo en Releases.
 
+## Novedades de la versión 1.1
+
+- **Bluetooth:** la pantalla muestra si el Bluetooth está encendido y qué dispositivo de audio
+  tiene conectado. Si el intercom se conecta o desconecta con el puente activo, el audio se
+  re-enruta solo. Al **apagar el Bluetooth el puente se detiene** (y se libera el Wi-Fi).
+- **Wi-Fi estable:** mientras el puente está activo la app mantiene bloqueos de Wi-Fi y una
+  solicitud de red para que Android no corte el hotspot por "no tener internet", y pide
+  (una vez) quedar fuera del ahorro de batería. La línea "Wi-Fi" muestra si se perdió la red.
+- **Música propia:** casilla "Mezclar mi música" con su propio control de volumen (1x a 10x).
+  Usa la captura de audio de Android (pide una confirmación que menciona la pantalla, pero
+  solo se toma el audio). Algunas apps de música bloquean que su audio sea capturado.
+- El APK ahora va firmado con una llave fija, así que se instala encima de la versión anterior.
+
 ## Pendiente
 
-- Compartir música del teléfono (hace falta captura de audio de otras apps).
+- Compartir la música con el otro teléfono.
 - Cifrado / contraseña: hoy cualquiera en la misma red podría mandar audio.

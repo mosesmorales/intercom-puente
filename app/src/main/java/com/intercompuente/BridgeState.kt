@@ -4,9 +4,12 @@ package com.intercompuente
 object BridgeState {
     @Volatile var running: Boolean = false
     @Volatile var muted: Boolean = false
-    @Volatile var gain: Float = 3f
+    @Volatile var gain: Float = 6f
+    @Volatile var musicGain: Float = 3f
+    @Volatile var musicOn: Boolean = false
     @Volatile var route: String = "-"
     @Volatile var peer: String = "-"
+    @Volatile var wifi: String = "-"
     @Volatile var myIps: String = "-"
     @Volatile var tx: Long = 0
     @Volatile var rx: Long = 0
